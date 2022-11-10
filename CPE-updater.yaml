@@ -1,0 +1,369 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Transform: AWS::Serverless-2016-10-31
+Description: Creates CPE pipeline resources 
+
+Metadata:
+  AWS::CloudFormation::Interface:
+    ParameterGroups:
+      - Label:
+          default: "Ground Station Parameters"
+        Parameters:
+          - SatelliteName
+          - NoradId
+          - TleExpiration
+          - NotificationEmail
+
+Parameters:
+
+  TleExpiration:
+    Description: Number of days that the ephemeris will be valid. 
+    Type: Number
+    Default: 6
+
+  SatelliteName:
+    Type: String
+    Description: Name of the satellite, for which you will be updating ephemeris. 
+    Default: "MY-SATELLITE"
+    AllowedPattern: "^[a-zA-Z0-9_:-]{1,256}$"
+
+  NoradId:
+    Type: String
+    Description: NoradId of the satellite, for which you will be updating ephemeris. 
+    Default: '999999'
+
+  NotificationEmail:
+    Default: 'someone@somewhere.com'
+    Description: "Email address to receive ephemeris update status."
+    Type: String
+    AllowedPattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
+    ConstraintDescription: "Must be a valid email adress"
+
+
+
+Resources:
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName:
+        Fn::Join:
+          - "-"
+          - - "GroundStation CPE Status"
+            - !Ref SatelliteName
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: "email"
+
+  Key:
+    Type: 'AWS::KMS::Key'
+    Properties:
+      Description: "KMS Key for bucket objects"
+      EnableKeyRotation: true
+      KeyPolicy: 
+        Version: 2012-10-17
+        Statement:
+          - Sid: Enable full access to root
+            Effect: Allow
+            Action: 'kms:*'
+            Resource: '*'
+            Principal:
+              AWS: !Sub 'arn:aws:iam::${AWS::AccountId}:root'
+  
+  ConfigBucket:
+    Type: AWS::S3::Bucket
+    DeletionPolicy: Delete
+    Properties:
+      BucketName: !Sub '${AWS::AccountId}-config-bucket-${AWS::Region}'
+      AccessControl: Private
+      BucketEncryption:
+        ServerSideEncryptionConfiguration:
+          - BucketKeyEnabled: True
+            ServerSideEncryptionByDefault:
+              SSEAlgorithm: 'aws:kms'
+              KMSMasterKeyID: !Ref Key
+  
+  BucketPolicy:
+    Type: AWS::S3::BucketPolicy
+    Properties:
+      Bucket: !Ref ConfigBucket
+      PolicyDocument:
+        Version: 2012-10-17
+        Statement:
+          - Action:
+              - 's3:GetObject'
+              - 's3:PutObject'
+            Condition:
+              Bool:
+                'aws:SecureTransport': false
+            Effect: Deny
+            Principal: '*'
+            Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-config-bucket-${AWS::Region}/*'
+            Sid: DenyUnencryptedConnections
+
+
+  AllowS3ToCallLambdaPermission:
+    Type: AWS::Lambda::Permission
+    Properties:
+      Action: 'lambda:InvokeFunction'
+      FunctionName: !Ref CpeUpdateLambda
+      Principal: s3.amazonaws.com
+      SourceArn: !GetAtt ConfigBucket.Arn
+      SourceAccount: !Sub '${AWS::AccountId}'
+
+  CpeUpdateLambda:
+    Type: 'AWS::Serverless::Function'
+    PackageType: Zip
+    Properties:
+      Events:
+        Upload:
+          Type: S3
+          Properties:
+            Bucket: !Ref ConfigBucket
+            Events: 's3:ObjectCreated:*'
+      InlineCode:
+          |
+          import os
+          import sys
+          import json
+          import urllib.parse
+          from time import sleep
+          from datetime import datetime, timedelta, timezone
+
+          # Force import latest version of boto3
+          sys.path.insert(0,"/opt/gs-boto")
+          print("sys.path:"+str(sys.path))
+
+          from pip._internal import main
+
+          main(['install', '-I', '-q', 'boto3', '--target', '/tmp/', '--no-cache-dir', '--disable-pip-version-check'])
+          sys.path.insert(0,'/tmp/')
+
+          import boto3
+          import botocore
+          from botocore.exceptions import ClientError
+
+          def handler(event, context):
+              print(boto3.__version__)
+
+          print("boto3 version:"+boto3.__version__)
+          print("botocore version:"+botocore.__version__)
+
+          s3 = boto3.client('s3')
+          gs = boto3.client('groundstation')
+
+          def handler(event, context):
+            print(event)
+            for record in event['Records']:
+              eventName = record['eventName']
+              bucket = record['s3']['bucket']['name']
+              key = record['s3']['object']['key']
+              if record['eventName'].startswith('ObjectCreated') and bucket == os.environ['BUCKET'] and key == os.environ['TLE_KEY']:
+
+                daysToLive = os.environ['EXPIRATION']
+                print(f"Getting {key} from {bucket}")
+                resp = s3.get_object(Bucket=bucket, Key=key)
+                lines = list(resp['Body'].iter_lines())
+                norad_id = os.environ['NORAD_ID']
+                print(f"Norad Id: {norad_id}")
+                satellites = gs.list_satellites()['satellites']
+                print(satellites)
+                satellite_id = next((s['satelliteId'] for s in satellites if str(s['noradSatelliteID']) == norad_id), None)
+                print(f"Satellite Id: {satellite_id}")
+                start_time = datetime.utcnow() - timedelta(days=1)
+                end_time = datetime.utcnow() + timedelta(days=int(daysToLive))
+                print(f"Start: {start_time}")
+                print(f"End: {end_time}")
+                tle = json.dumps([{
+                  "tleLine1": lines[1].decode('UTF-8'),
+                  "tleLine2": lines[2].decode('UTF-8'),
+                  "validTimeRange": {
+                    "startTime": start_time.isoformat(),
+                    "endTime": end_time.isoformat()
+                  }
+                }], indent=2)
+                json_key = f"{key}.json"
+                print(f"Putting: {json_key}")
+                print(f"Into: {bucket}")
+                s3.put_object(
+                  Bucket=bucket,
+                  Key=json_key,
+                  Body=tle
+                )
+
+                print("Creating Ephemeris from")
+                result = gs.create_ephemeris(
+                  name=f"{norad_id}",
+                  satelliteId=satellite_id,
+                  expirationTime=end_time,
+                  enabled=True,
+                  kmsKeyArn=os.environ['KMS_KEY'],
+                  ephemeris = {
+                    "tle": {
+                      "s3Object": {
+                        "bucket": bucket,
+                        "key": json_key
+                      }
+                    }
+                  }
+                )
+                ephem_id = result['ephemerisId']
+                print(f"Polling status for ${ephem_id}")
+                resp = gs.describe_ephemeris(ephemerisId=ephem_id)
+                status = resp['status']
+                print(status)
+                while status == 'VALIDATING':
+                  sleep(5)
+                  resp = gs.describe_ephemeris(ephemerisId=ephem_id)
+                  status = resp['status']
+                  print(status)
+
+                print("Done polling")
+                print(resp)
+
+                sendSNS(key, ephem_id, status)
+                
+                return {'ephemeris_id': ephem_id, status: status}
+              
+              
+              if record['eventName'].startswith('ObjectCreated') and bucket == os.environ['BUCKET'] and key == os.environ['OEM_KEY']:
+                
+                daysToLive = os.environ['EXPIRATION']
+                norad_id = os.environ['NORAD_ID']
+                print(f"Norad Id: {norad_id}")
+                satellites = gs.list_satellites()['satellites']
+                print(satellites)
+                satellite_id = next((s['satelliteId'] for s in satellites if str(s['noradSatelliteID']) == norad_id), None)
+                print(f"Satellite Id: {satellite_id}")
+                start_time = datetime.utcnow() - timedelta(days=1)
+                end_time = datetime.utcnow() + timedelta(days=int(daysToLive))
+                print(f"Start: {start_time}")
+                print(f"End: {end_time}")
+                
+                key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
+              
+                result = gs.create_ephemeris(
+                  name='Norad Id',
+                  satelliteId=satellite_id,
+                  enabled=True,
+                  expirationTime=end_time,
+                  kmsKeyArn=os.environ['KMS_KEY'],
+                  ephemeris = {
+                      "oem":{
+                          "s3Object": {
+                              "bucket": bucket,
+                              "key": key
+                          }
+                      }
+                  }
+                )
+            
+                ephem_id = result['ephemerisId']
+                print(f"Polling status for ${ephem_id}")
+                resp = gs.describe_ephemeris(ephemerisId=ephem_id)
+                status = resp['status']
+                print(status)
+                while status == 'VALIDATING':
+                  sleep(5)
+                  resp = gs.describe_ephemeris(ephemerisId=ephem_id)
+                  status = resp['status']
+                  print(status)
+
+                print("Done polling")
+                print(resp)
+                
+                sendSNS(key, ephem_id, status)
+                
+                return {'ephemeris_id': ephem_id, status: status}
+
+              return {'ephemeris_id': None}
+
+          def sendSNS(key, ephem_id, status):
+              # SNS message
+              print("Sending SNS notification.")
+              snsclient = boto3.client('sns', region_name = os.environ.get("AWS_REGION"))
+              now = datetime.now(timezone.utc).strftime("%I:%M%p %B %d, %Y")
+              FileName = "For the CPE file " + key
+              DateTime = " uploaded on " + now
+              EphemerisID = " the Ephemeris ID is " + ephem_id
+              EphemerisStatus = " and the status is " + status
+              
+              response = snsclient.publish(
+                  TargetArn=os.environ.get("SNS_TOPIC"),
+                  Message= FileName + DateTime + EphemerisID + EphemerisStatus,
+                  Subject='Ground Station CPE Status',
+              )
+
+      Handler: index.handler
+      Environment:
+        Variables:
+          TLE_KEY: !Sub 'configs/${SatelliteName}-tle.txt'
+          OEM_KEY: !Sub 'configs/${SatelliteName}.oem'
+          BUCKET: !Sub '${AWS::AccountId}-config-bucket-${AWS::Region}'
+          NORAD_ID: !Ref NoradId
+          EXPIRATION: !Ref TleExpiration
+          KMS_KEY: !GetAtt Key.Arn
+          SNS_TOPIC: !Ref SNSTopic
+      Policies:
+        - AWSLambdaExecute
+        - Version: '2012-10-17'
+          Statement:
+            - Effect: Allow
+              Action: 
+                - 'groundstation:ListSatellites'
+              Resource: !Sub 'arn:aws:groundstation:${AWS::Region}:${AWS::AccountId}:/satellite'
+            - Effect: Allow
+              Action: 
+                - 'groundstation:CreateEphemeris'
+              Resource: !Sub 'arn:aws:groundstation:${AWS::Region}:${AWS::AccountId}:/ephemeris'
+            - Effect: Allow
+              Action: 
+                - 'groundstation:DescribeEphemeris'
+              Resource: !Sub 'arn:aws:groundstation:*'
+            - Effect: Allow
+              Action:
+                - 's3:GetObject'
+                - 's3:PutObject'
+              Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-config-bucket-${AWS::Region}/*'
+            - Effect: Allow
+              Action:
+                - 'kms:Encrypt'
+                - 'kms:Decrypt'
+                - 'kms:GenerateDataKey*'
+                - 'kms:DescribeKey'
+                - 'kms:CreateGrant'
+              Resource: !GetAtt Key.Arn
+            - Effect: Allow
+              Action:
+                - 'logs:CreateLogGroup'
+                - 'logs:CreateLogStream'
+                - 'logs:PutLogEvents'
+              Resource: 'arn:aws:logs:*:*:*'
+            - Effect: Allow 
+              Action: 
+                - "sns:Publish"
+              Resource: !Ref SNSTopic
+
+      Runtime: python3.9
+      Timeout: 300
+
+Outputs:
+  BucketName:
+    Value: !Ref ConfigBucket
+    Description: Name of the S3 bucket that holds ephemeris. 
