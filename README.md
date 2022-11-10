@@ -1,10 +1,10 @@
-# CPE (Customer Provided Ephemeris)
+# Using customer provided ephemeris (CPE) with AWS Ground Station
 
 This guide deploys a pipeline that uses AWS Ground Station Customer Provided Ephemeris (CPE) to update antenna pointing instructions within the service. 
 CPE allows customers to provide their own orbital parameters, rather than AWS Ground Station obtaining the information automatically, 
 this is especially useful during LEOP when ephemeris data is not yet available from NORAD and for craft that are not tracked by NORAD. 
 
-Please refer to the groundstation-api guide for additional information on how the CPE API works.
+Please refer to the [AWS Ground Station API](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/groundstation.html) guide for additional information on how the CPE API works.
 
 # Solution diagram
 
