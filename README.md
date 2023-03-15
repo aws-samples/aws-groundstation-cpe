@@ -112,13 +112,15 @@ Using JPSS-1 as an example:
 
 # Automatic contact rescheduling after ephemeris update 
 
-This optional section creates a Lambda function that is triggered when a CPE entry is updated and goes into the `ENABLED` state. The function cancels all future passes scheduled with a provided mission profile and satellite, whose CPE you have updated. Then it reschedules the closest possible passes using the updated CPE. This corresponds to steps 6 to 8 of the extended high level solution diagram shown below.
+This optional section creates a Lambda function that is triggered when a CPE entry is updated and goes into the `ENABLED` state. The function cancels all passes scheduled within the next 6 days with a provided mission profile and satellite, whose CPE you have updated. Then it reschedules the closest possible passes using the updated CPE. This corresponds to steps 6 to 8 of the extended high level solution diagram shown below.
 
 If you choose to deploy the optional automatic rescheduler part you will need a AWS Ground Station mission profile. For the JPSS-1 example you can create a mission profile by following the guide here: https://aws.amazon.com/blogs/publicsector/automated-earth-observation-aws-ground-station-amazon-s3-data-delivery/. If you're using your own satellite make sure you have a deployed mission profile for it. 
 
 ![Rescheduling-high-level-diagram](./gs-cpe-hl-diagram-rescheduling.png)
 
 ## CloudFormation deployment 
+
+You **must** deploy the this CloudFormation stack in the same AWS region as the mission profile you are using. This is because AWS Ground Station mission profiles are regional constructs. 
 
 Continuing with the JPSS-1 example:
 
