@@ -40,13 +40,12 @@ Parameters:
   SatelliteName:
     Type: String
     Description: Name of the satellite, for which you will be updating ephemeris. 
-    Default: "MY-SATELLITE"
-    AllowedPattern: "^[a-zA-Z0-9_:-]{1,256}$"
+    Default: "JPSS-1"
 
   NoradId:
     Type: String
     Description: NoradId of the satellite, for which you will be updating ephemeris. 
-    Default: '999999'
+    Default: '43013'
 
   NotificationEmail:
     Default: 'someone@somewhere.com'
@@ -65,7 +64,7 @@ Resources:
       DisplayName:
         Fn::Join:
           - "-"
-          - - "GroundStation CPE Status"
+          - - "GroundStation-CPE-Status"
             - !Ref SatelliteName
       Subscription:
         - Endpoint: !Ref NotificationEmail

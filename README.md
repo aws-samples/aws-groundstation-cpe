@@ -4,13 +4,15 @@ This guide deploys a pipeline that uses AWS Ground Station Customer Provided Eph
 CPE allows customers to provide their own orbital parameters, rather than AWS Ground Station obtaining the information automatically, 
 this is especially useful during LEOP when ephemeris data is not yet available from NORAD and for craft that are not tracked by NORAD. 
 
+There is also an option section at the end of this document on deploying a lambda function, which will automatically reschedule any future contacts for the satellite to ensure the updated orbital parameters are used.
+
 Please refer to the [AWS Ground Station API](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/groundstation.html) guide for additional information on how the CPE API works.
 
-# Solution diagram
+## Solution diagram
 
 ![High-level-diagram](./gs-cpe-hl-diagram.png)
 
-# Pre-requisites
+## Pre-requisites
 
 This guide use the JPSS-1 craft as an example, so you must have it on boarded into your AWS account. Alternatively, you can use your own craft by setting the "SatelliteName" parameter in the CloudFormation template to your craft name. 
 
@@ -19,10 +21,9 @@ To get JPSS-1 onboarded to your account for the CPE public beta send an email to
 - You AWS Account Id
 - AWS Regions you want use the Ground Station Service
 - AWS Regions you want to downlink the data to, normally the same as above
-- Request CPE public beta access for JPSS-1
 
 
-# Deployment 
+## Deployment 
 
 Create a CloudFormation stack using the template: CPE-updater.yml. [Learn how to create a CloudFormation stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-create-stack.html). On the [stack creation console](https://console.aws.amazon.com/cloudformation) click Create Stack -> With New Resource. Then select the "Template is ready" radio button and "Upload a template file" radio button. Upload the CPE-updater.yml file here. 
 
@@ -34,7 +35,7 @@ Enter parameters as follows in the CloudFormation console and then deploy the st
 - NotificationEmail: Email address to receive ephemeris update status.
 
 
-# Updating TLEs for a satellite
+## Updating TLEs for a satellite
 
 Create a file named `some_satellite-tle.txt` (replacing `some_satellite` with your satellite name). 
 
@@ -79,7 +80,7 @@ curl https://celestrak.org/NORAD/elements/gp.php\?CATNR\=43013 -o JPSS-1-tle.txt
         VALIDATION_ERROR - Internal service error occurred while processing ephemeris for validation
 
 
-# Updating OEMs for a satellite
+## Updating OEMs for a satellite
 
 Save your OEM file as `some_satellite.oem` (replacing `some_satellite` with your satellite name). 
 
@@ -107,3 +108,32 @@ Using JPSS-1 as an example:
 
 
 
+
+
+# Automatic contact rescheduling after ephemeris update 
+
+This optional section creates a Lambda function that is triggered when a CPE entry is updated and goes into the `ENABLED` state. The function cancels all future passes scheduled with a provided mission profile and satellite, whose CPE you have updated. Then it reschedules the closest possible passes using the updated CPE. This corresponds to steps 6 to 8 of the extended high level solution diagram shown below.
+
+If you choose to deploy the optional automatic rescheduler part you will need a AWS Ground Station mission profile. For the JPSS-1 example you can create a mission profile by following the guide here: https://aws.amazon.com/blogs/publicsector/automated-earth-observation-aws-ground-station-amazon-s3-data-delivery/. If you're using your own satellite make sure you have a deployed mission profile for it. 
+
+![Rescheduling-high-level-diagram](./gs-cpe-hl-diagram-rescheduling.png)
+
+## CloudFormation deployment 
+
+Continuing with the JPSS-1 example:
+
+Create a CloudFormation stack using the template: rescheduler.yml. [Learn how to create a CloudFormation stack](https://docs.aws.amazon.com/AWSCloudFormation/latest/UserGuide/cfn-console-create-stack.html). On the [stack creation console](https://console.aws.amazon.com/cloudformation) click Create Stack -> With New Resource. Then select the "Template is ready" radio button and "Upload a template file" radio button. Upload the rescheduler.yml file here. 
+
+Enter parameters as follows in the CloudFormation console and then deploy the stack:
+
+- MissionProfileName: The name of the AWS Ground Station Mission Profile for the satellite using CPE. (For the JPSS-1 example use the mission profile you deployed using the S3 data delivery blog)
+- NotificationEmail: "Email address to receive contact rescheduling updates"
+
+
+## Auto-rescheduler post-implementation test plan
+
+1. Using the same mission profile schedule 2 contacts with the satellite, whose CPE you're updating (JPSS-1 NORAD ID: 43013) and 1 contact with another satellite (AQUA NORAD ID: 27424). 
+2. Update the ephemeris of JPSS-1 using either the TLE or OEM method. 
+3. Confirm the CpeUpdateLambda was successful (using the steps above). 
+4. Confirm the GroundStationCloudWatchEventHandlerLambda Lambda worked correctly (part of the Rescheduler CFN stack). Do this by checking its CloudWatch logs. 
+5. Check your email for an SNS notification. Only the 2 contacts scheduled with the CPE updated satellite should have been rescheduled. The other contact should **not** have been canceled and rescheduled.

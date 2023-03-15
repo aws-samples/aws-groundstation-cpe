@@ -1,0 +1,296 @@
+---
+# Copyright Amazon.com, Inc. or its affiliates. All Rights Reserved.
+# SPDX-License-Identifier: MIT-0
+
+# Permission is hereby granted, free of charge, to any person obtaining a copy of this
+# software and associated documentation files (the "Software"), to deal in the Software
+# without restriction, including without limitation the rights to use, copy, modify,
+# merge, publish, distribute, sublicense, and/or sell copies of the Software, and to
+# permit persons to whom the Software is furnished to do so.
+
+# THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR IMPLIED,
+# INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS FOR A
+# PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE AUTHORS OR COPYRIGHT
+# HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION
+# OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
+# SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
+
+AWSTemplateFormatVersion: '2010-09-09'
+Description: Rescheduler Lambda for TLE updates
+
+
+Parameters: 
+
+  MissionProfileName:
+    Description: The name of the AWS Ground Station Mission Profile for the satellite using CPE.
+    Type: String
+    Default: ""
+    
+  NotificationEmail:
+    Default: 'noone@nowhere.com'
+    Description: "Email address to receive contact rescheduling updates"
+    Type: String
+    AllowedPattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
+    ConstraintDescription: "Must be a valid email address"
+
+Resources:
+
+  SNSTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      DisplayName:
+        Fn::Join:
+          - "-"
+          - - "Ground-Station-Contact-Rescheduling"
+            - !Ref MissionProfileName
+      Subscription:
+        - Endpoint: !Ref NotificationEmail
+          Protocol: "email"
+
+
+# ============================================
+# GroundStation CloudWatch events and Lambda
+# ============================================
+
+# Events received in the region where the CPE is being updated.
+# Events sent when CPE transitions into ENABLED. 
+# Lambda cancels and reschules all future booked contacts with new CPE. 
+# Lambda function has been trimmed to stay within the 4096 char Lambda zipfile limit
+
+  GroundStationCloudWatchEventHandlerLambda:
+    Type: AWS::Lambda::Function
+    Properties:
+      Handler: index.handle_cloudwatch_event
+      Runtime: python3.9
+      MemorySize: 128
+      Timeout: 300
+      Role: !GetAtt GroundStationCloudWatchEventHandlerLambdaRole.Arn
+      Environment:
+        Variables:
+          PRIMARY_MISSION_PROFILE: !Ref MissionProfileName
+          SNS_TOPIC: !Ref SNSTopic
+      Code:
+        ZipFile:
+          |  
+          import json
+          import logging
+          import os
+          import time
+          import datetime
+          import boto3
+
+          logger = logging.getLogger(__name__)
+          logger.setLevel(logging.INFO)
+
+          PRIMARY_MISSION_PROFILE_NAME = os.environ.get("PRIMARY_MISSION_PROFILE")
+          SNS_TOPIC_ARN = os.environ.get("SNS_TOPIC")
+
+          def handle_cloudwatch_event(lambda_event, context):
+            logger.info(f"handle_cloudwatch_event: Called with event {json.dumps(lambda_event)}")
+            
+            satellite_id = lambda_event.get("detail", {}).get("satelliteId")
+            
+            account_id = lambda_event.get("account")
+            
+            satellite_arn = "arn:aws:groundstation::" + str(account_id) + ":satellite/" + str(satellite_id)
+            
+            gs_client = boto3.client("groundstation")
+            
+            scheduled_contacts = get_scheduled_contacts(gs_client,PRIMARY_MISSION_PROFILE_NAME, satellite_arn)
+            
+            logger.info("Contacts scheduled with mission profile " + PRIMARY_MISSION_PROFILE_NAME + str(scheduled_contacts))
+            
+            cancel_scheduled_contacts(gs_client, scheduled_contacts)
+            
+            reschedule_with_new_cpe(gs_client, scheduled_contacts, PRIMARY_MISSION_PROFILE_NAME)
+            
+            rescheduled_contacts = get_scheduled_contacts(gs_client,PRIMARY_MISSION_PROFILE_NAME, satellite_arn)
+            
+            logger.info("Contacts scheduled with mission profile " + PRIMARY_MISSION_PROFILE_NAME + str(rescheduled_contacts))
+            
+            message_body={}
+            message_body["AWS Ground Station Update CPE Contact Rescheduling Lambda called with event"] = lambda_event
+            message_body[str(len(scheduled_contacts)) + " original contacts scheduled with " + PRIMARY_MISSION_PROFILE_NAME] = scheduled_contacts
+            message_body[str(len(rescheduled_contacts)) + " contacts rescheduled with new CPE and " + PRIMARY_MISSION_PROFILE_NAME] = rescheduled_contacts
+
+            logger.info("Sending " + json.dumps(message_body, default=str))
+            client = boto3.client('sns', region_name = os.environ.get("AWS_REGION"))
+            response = client.publish(
+                TargetArn=SNS_TOPIC_ARN,
+                Message=json.dumps(message_body, default=str, indent=4)
+            )
+
+            
+            
+          def get_mission_profile_arn(gs_client, profile_name):
+              profile_arn = ""
+              mission_profile_list = gs_client.list_mission_profiles()
+
+              for profile in mission_profile_list["missionProfileList"]:
+                  if profile["name"] == profile_name:
+                      profile_arn = profile["missionProfileArn"]
+                      break
+              if profile_arn == "":
+                  logger.info(profile_name + " is not a valid profile name")
+              return profile_arn
+              
+
+          def get_scheduled_contacts(gs_client, mission_profile_name, satellite_arn):
+            scheduling_window_days = 6
+            pass_window_start_date = datetime.datetime.now() 
+            pass_window_end_date = pass_window_start_date + datetime.timedelta(days=scheduling_window_days)
+            all_passes = []
+            
+            mission_profile_arn = get_mission_profile_arn(gs_client, mission_profile_name)
+            logger.info("Mission profile: " + mission_profile_name + " has ARN: " + mission_profile_arn)
+            pass_list = gs_client.list_contacts(
+                endTime=pass_window_end_date,
+                startTime=pass_window_start_date,
+                missionProfileArn=mission_profile_arn,
+                satelliteArn=satellite_arn,
+                statusList=["SCHEDULED"]
+            )
+            all_passes.append(pass_list["contactList"])
+            flat_passes = [item for sublist in all_passes for item in sublist]
+            flat_passes.sort(key=lambda item: item["startTime"], reverse=False)
+            return flat_passes 
+
+
+          def cancel_scheduled_contacts(gs_client, scheduled_contacts):
+            for contact in scheduled_contacts:
+              cancellation = gs_client.cancel_contact(contactId=contact["contactId"])
+              backoff = 2
+              contact_status = gs_client.describe_contact(contactId=contact["contactId"])["contactStatus"]
+              while(contact_status != "CANCELLED"):
+                time.sleep(backoff)
+                contact_status = gs_client.describe_contact(contactId=contact["contactId"])["contactStatus"]  
+              logger.info("Cancelled contact with ID: " + cancellation["contactId"])
+              
+              
+          def reschedule_with_new_cpe(gs_client, scheduled_contacts, mission_profile_name):
+            mission_profile_arn = get_mission_profile_arn(gs_client, mission_profile_name)
+            logger.info("Mission profile: " + mission_profile_name + " has ARN: " + mission_profile_arn)
+            
+            for contact in scheduled_contacts:
+              logger.info("Rescheduling contact " + str(contact) + str(contact["endTime"]))
+              try: 
+                reservation = gs_client.reserve_contact(
+                    endTime=contact["endTime"],
+                    groundStation=contact["groundStation"],
+                    missionProfileArn=mission_profile_arn,
+                    satelliteArn=contact["satelliteArn"],
+                    startTime=contact["startTime"],
+                )
+              except: 
+                logger.info("Original contact is not available with new CPE: " + str(contact))
+                scheduled_closest_contact(gs_client, contact, mission_profile_arn)
+              else:  
+                contact_Id = reservation["contactId"]
+                contact_status = gs_client.describe_contact(contactId=contact_Id)["contactStatus"]
+                backoff = 2
+                while(contact_status == "SCHEDULING"):
+                  time.sleep(backoff)
+                  contact_status = gs_client.describe_contact(contactId=contact_Id)["contactStatus"]
+                  print(f"{contact_status} contact with ID {contact_Id}")
+                  backoff = backoff * 2
+
+                if(contact_status == "SCHEDULED"):
+                  logger.info("New contact ID: " + reservation["contactId"])
+                
+                if(contact_status == "FAILED_TO_SCHEDULE"):
+                  logger.info("Looking for closest contact. Failed to schedule orignal contact with new CPE: " + str(contact)) 
+                  scheduled_closest_contact(gs_client, contact, mission_profile_arn)
+
+
+          def scheduled_closest_contact(gs_client, contact, mission_profile_arn):
+            logger.info("Finding closest available contact to original contact: " + str(contact))
+            next_available_pass = gs_client.list_contacts(
+                endTime=contact["endTime"]+datetime.timedelta(days=2),
+                startTime=contact["startTime"]-datetime.timedelta(minutes=5),
+                missionProfileArn=mission_profile_arn,
+                statusList=["AVAILABLE"],
+                satelliteArn=contact["satelliteArn"],
+                groundStation=contact["groundStation"],
+                maxResults=1
+            )
+            next_contact = next_available_pass["contactList"][0]
+            reservation = gs_client.reserve_contact(
+                    endTime=next_contact["endTime"],
+                    groundStation=next_contact["groundStation"],
+                    missionProfileArn=mission_profile_arn,
+                    satelliteArn=next_contact["satelliteArn"],
+                    startTime=next_contact["startTime"],
+                )
+            contact_Id = reservation["contactId"]
+            contact_status = gs_client.describe_contact(contactId=contact_Id)["contactStatus"]
+            backoff = 2
+            while(contact_status == "SCHEDULING"):
+              time.sleep(backoff)
+              contact_status = gs_client.describe_contact(contactId=contact_Id)["contactStatus"]
+              print(f"{contact_status} contact with ID {contact_Id}")
+              backoff = backoff * 2
+
+            if(contact_status == "SCHEDULED"):  
+              logger.info("New contact ID: " + reservation["contactId"])     
+
+
+  GroundStationCloudWatchEventHandlerLambdaRolePolicy:
+    Type: AWS::IAM::ManagedPolicy
+    Properties:
+      PolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Action:
+              - groundstation:*
+            Resource:
+              - '*'
+          - Effect: Allow 
+            Action: 
+              - "sns:Publish"
+            Resource: !Ref SNSTopic
+
+  GroundStationCloudWatchEventHandlerLambdaRole:
+    Type: AWS::IAM::Role
+    Properties:
+      Path: '/'
+      ManagedPolicyArns:
+        - arn:aws:iam::aws:policy/service-role/AWSLambdaBasicExecutionRole
+        - !Ref GroundStationCloudWatchEventHandlerLambdaRolePolicy
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+        - Effect: Allow
+          Principal:
+            Service: lambda.amazonaws.com
+          Action:
+            - sts:AssumeRole
+
+  # CW Event for CPE state changes
+  GroundStationCloudWatchEventRuleCpe:
+    DependsOn: GroundStationCloudWatchEventHandlerLambda
+    Type: AWS::Events::Rule
+    Properties:
+      Description: "An event rule to trigger on Ephemeris LifeCycle events"
+      EventPattern:
+        source:
+          - "aws.groundstation"
+        detail-type:
+          - "Ground Station Ephemeris Status Change"
+        detail:
+          ephemerisStatus:
+           - ENABLED
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt GroundStationCloudWatchEventHandlerLambda.Arn
+          Id: "GroundStationCloudWatchEventHandler"
+
+  # Permission for the CW Event to invoke Lambda 
+  PermissionForGroundStationCloudWatchEventsToInvokeLambda:
+    DependsOn: GroundStationCloudWatchEventRuleCpe
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref GroundStationCloudWatchEventHandlerLambda
+      Action: "lambda:InvokeFunction"
+      Principal: "events.amazonaws.com"
+      SourceArn: !GetAtt GroundStationCloudWatchEventRuleCpe.Arn
