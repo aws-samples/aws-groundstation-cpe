@@ -4,7 +4,7 @@ This guide deploys a pipeline that uses AWS Ground Station Customer Provided Eph
 CPE allows customers to provide their own orbital parameters, rather than AWS Ground Station obtaining the information automatically, 
 this is especially useful during LEOP when ephemeris data is not yet available from NORAD and for craft that are not tracked by NORAD. 
 
-There is also an option section at the end of this document on deploying a lambda function, which will automatically reschedule any future contacts for the satellite to ensure the updated orbital parameters are used.
+There is also an option section at the end of this document on deploying a lambda function, which will automatically reschedule any contacts 6 days into the future for the satellite to ensure the updated orbital parameters are used.
 
 Please refer to the [AWS Ground Station API](https://boto3.amazonaws.com/v1/documentation/api/latest/reference/services/groundstation.html) guide for additional information on how the CPE API works.
 
