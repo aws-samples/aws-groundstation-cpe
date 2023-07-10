@@ -61,6 +61,7 @@ Resources:
   SNSTopic:
     Type: AWS::SNS::Topic
     Properties:
+      KmsMasterKeyId: alias/aws/sns
       DisplayName:
         Fn::Join:
           - "-"
