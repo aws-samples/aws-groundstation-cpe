@@ -15,6 +15,11 @@
 # OF CONTRACT, TORT OR OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE
 # SOFTWARE OR THE USE OR OTHER DEALINGS IN THE SOFTWARE.
 
+# Note: If you are receiving a status of INVALID for a TLE file. Paste the TLE file here to see what is wrong: https://www.whatswrongwithmytle.com/
+# It is sometimes an incorrect checksum that can be fixed using this site by simply changing the last digit to the correct checksum
+# For information related to the TLE format: https://celestrak.org/NORAD/documentation/tle-fmt.php
+# For information related to the supported OEM format: https://docs.aws.amazon.com/ground-station/latest/ug/providing-custom-ephemeris-data.html
+
 AWSTemplateFormatVersion: '2010-09-09'
 Transform: AWS::Serverless-2016-10-31
 Description: Creates CPE pipeline resources 
@@ -29,6 +34,7 @@ Metadata:
           - NoradId
           - TleExpiration
           - NotificationEmail
+          - SatelliteId
 
 Parameters:
 
@@ -39,8 +45,8 @@ Parameters:
 
   SatelliteName:
     Type: String
-    Description: Name of the satellite, for which you will be updating ephemeris. 
-    Default: "JPSS-1"
+    Description: Name of the satellite, for which you will be updating ephemeris. MUST BE LOWER CASE
+    Default: "jpss-1"
 
   NoradId:
     Type: String
@@ -54,7 +60,10 @@ Parameters:
     AllowedPattern: "^[a-zA-Z0-9_.+-]+@[a-zA-Z0-9-]+\\.[a-zA-Z0-9-.]+$"
     ConstraintDescription: "Must be a valid email adress"
 
-
+  SatelliteId:
+    Type: String
+    Description: The UUID of the satellite as assigned by the Ground Station Service. Leave empty to automatically obtain the ID using the NORAD ID.
+    Default: ""
 
 Resources:
 
@@ -88,9 +97,14 @@ Resources:
   
   ConfigBucket:
     Type: AWS::S3::Bucket
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W35
+            reason: S3 logging is not required on this bucket as it contains only transient data
     DeletionPolicy: Delete
     Properties:
-      BucketName: !Sub '${AWS::AccountId}-config-bucket-${AWS::Region}'
+      BucketName: !Sub '${AWS::AccountId}-config-bucket-${SatelliteName}-${AWS::Region}'
       AccessControl: Private
       BucketEncryption:
         ServerSideEncryptionConfiguration:
@@ -114,7 +128,7 @@ Resources:
                 'aws:SecureTransport': false
             Effect: Deny
             Principal: '*'
-            Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-config-bucket-${AWS::Region}/*'
+            Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-config-bucket-${SatelliteName}-${AWS::Region}/*'
             Sid: DenyUnencryptedConnections
 
 
@@ -129,8 +143,14 @@ Resources:
 
   CpeUpdateLambda:
     Type: 'AWS::Serverless::Function'
+    Metadata:
+      cfn_nag:
+        rules_to_suppress:
+          - id: W89
+            reason: Function is not required in a VPC; deploying outside a VPC simplifies deployment
     PackageType: Zip
     Properties:
+      ReservedConcurrentExecutions: 10
       Events:
         Upload:
           Type: S3
@@ -174,18 +194,33 @@ Resources:
               eventName = record['eventName']
               bucket = record['s3']['bucket']['name']
               key = record['s3']['object']['key']
-              if record['eventName'].startswith('ObjectCreated') and bucket == os.environ['BUCKET'] and key == os.environ['TLE_KEY']:
+              execution_time = record['eventTime']
 
-                daysToLive = os.environ['EXPIRATION']
+              daysToLive = os.environ['EXPIRATION']
+              satellite_id = os.environ['SATELLITE_ID']
+              norad_id = os.environ['NORAD_ID']
+              tle_key = os.environ['TLE_KEY']
+              oem_key = os.environ['OEM_KEY']
+              s3_bucket = os.environ['BUCKET']
+
+              if satellite_id == '':
+                print(f"Getting Satellite ID from NORAD ID: {norad_id}")
+                satellites = gs.list_satellites()['satellites']
+                satellite_id = next((s['satelliteId'] for s in satellites if str(s['noradSatelliteID']) == norad_id), None)
+              
+              if record['eventName'].startswith('ObjectCreated') and bucket == s3_bucket and key == tle_key:
+
+                print(f"Norad Id: {norad_id}")
+                print(f"S3 Bucket: {s3_bucket}")
+                print(f"Satellite Id: {satellite_id}")
                 print(f"Getting {key} from {bucket}")
+
                 resp = s3.get_object(Bucket=bucket, Key=key)
                 lines = list(resp['Body'].iter_lines())
-                norad_id = os.environ['NORAD_ID']
-                print(f"Norad Id: {norad_id}")
-                satellites = gs.list_satellites()['satellites']
-                print(satellites)
-                satellite_id = next((s['satelliteId'] for s in satellites if str(s['noradSatelliteID']) == norad_id), None)
-                print(f"Satellite Id: {satellite_id}")
+                # daysToLive = os.environ['EXPIRATION']
+                # satellite_id = os.environ['SATELLITE_ID']
+                # norad_id = os.environ['NORAD_ID']
+
                 start_time = datetime.utcnow() - timedelta(days=1)
                 end_time = datetime.utcnow() + timedelta(days=int(daysToLive))
                 print(f"Start: {start_time}")
@@ -199,30 +234,34 @@ Resources:
                   }
                 }], indent=2)
                 json_key = f"{key}.json"
-                print(f"Putting: {json_key}")
-                print(f"Into: {bucket}")
+                print(f"Uploading TLE data to: s3://{bucket}/{json_key}")
                 s3.put_object(
                   Bucket=bucket,
                   Key=json_key,
                   Body=tle
                 )
 
-                print("Creating Ephemeris from")
-                result = gs.create_ephemeris(
-                  name=f"{norad_id}",
-                  satelliteId=satellite_id,
-                  expirationTime=end_time,
-                  enabled=True,
-                  kmsKeyArn=os.environ['KMS_KEY'],
-                  ephemeris = {
-                    "tle": {
-                      "s3Object": {
-                        "bucket": bucket,
-                        "key": json_key
+                print(f"Creating Ephemeris from file: {tle_key}")
+                try:
+                  result = gs.create_ephemeris(
+                    name=f"{norad_id}",
+                    satelliteId=satellite_id,
+                    expirationTime=end_time,
+                    enabled=True,
+                    kmsKeyArn=os.environ['KMS_KEY'],
+                    ephemeris = {
+                      "tle": {
+                        "s3Object": {
+                          "bucket": bucket,
+                          "key": json_key
+                        }
                       }
                     }
-                  }
-                )
+                  )
+                except Exception as e:
+                  print(f"Error creating Ephemeris from file: {tle_key}. Error: {e}")
+                  return {'ephemeris_id': None}
+
                 ephem_id = result['ephemerisId']
                 print(f"Polling status for ${ephem_id}")
                 resp = gs.describe_ephemeris(ephemerisId=ephem_id)
@@ -232,25 +271,23 @@ Resources:
                   sleep(5)
                   resp = gs.describe_ephemeris(ephemerisId=ephem_id)
                   status = resp['status']
-                  print(status)
+                  print(f"Status: {status}")
 
-                print("Done polling")
+                print("Response from describe_ephemeris: ")
                 print(resp)
 
-                sendSNS(key, ephem_id, status)
+                sendSNS(key, ephem_id, status, satellite_id, execution_time)
                 
                 return {'ephemeris_id': ephem_id, status: status}
               
               
-              if record['eventName'].startswith('ObjectCreated') and bucket == os.environ['BUCKET'] and key == os.environ['OEM_KEY']:
-                
-                daysToLive = os.environ['EXPIRATION']
-                norad_id = os.environ['NORAD_ID']
+              elif record['eventName'].startswith('ObjectCreated') and bucket == s3_bucket and key == oem_key:
+
                 print(f"Norad Id: {norad_id}")
-                satellites = gs.list_satellites()['satellites']
-                print(satellites)
-                satellite_id = next((s['satelliteId'] for s in satellites if str(s['noradSatelliteID']) == norad_id), None)
+                print(f"S3 Bucket: {s3_bucket}")
                 print(f"Satellite Id: {satellite_id}")
+                print(f"Getting {key} from {bucket}")
+
                 start_time = datetime.utcnow() - timedelta(days=1)
                 end_time = datetime.utcnow() + timedelta(days=int(daysToLive))
                 print(f"Start: {start_time}")
@@ -258,22 +295,27 @@ Resources:
                 
                 key = urllib.parse.unquote_plus(event['Records'][0]['s3']['object']['key'], encoding='utf-8')
               
-                result = gs.create_ephemeris(
-                  name='Norad Id',
-                  satelliteId=satellite_id,
-                  enabled=True,
-                  expirationTime=end_time,
-                  kmsKeyArn=os.environ['KMS_KEY'],
-                  ephemeris = {
-                      "oem":{
-                          "s3Object": {
-                              "bucket": bucket,
-                              "key": key
-                          }
-                      }
-                  }
-                )
-            
+                print(f"Creating Ephemeris from file: {oem_key}")
+                try:
+                  result = gs.create_ephemeris(
+                    name='Norad Id',
+                    satelliteId=satellite_id,
+                    enabled=True,
+                    expirationTime=end_time,
+                    kmsKeyArn=os.environ['KMS_KEY'],
+                    ephemeris = {
+                        "oem":{
+                            "s3Object": {
+                                "bucket": bucket,
+                                "key": key
+                            }
+                        }
+                    }
+                  )
+                except Exception as e:
+                  print(f"Error creating Ephemeris from file: {oem_key}. Error: {e}")
+                  return {'ephemeris_id': None}
+
                 ephem_id = result['ephemerisId']
                 print(f"Polling status for ${ephem_id}")
                 resp = gs.describe_ephemeris(ephemerisId=ephem_id)
@@ -288,25 +330,29 @@ Resources:
                 print("Done polling")
                 print(resp)
                 
-                sendSNS(key, ephem_id, status)
+                sendSNS(key, ephem_id, status, satellite_id, execution_time)
                 
                 return {'ephemeris_id': ephem_id, status: status}
+              
+              else:
+                print(f"Key: {key} is not the name of an ephemeris file processed by this function")
 
               return {'ephemeris_id': None}
 
-          def sendSNS(key, ephem_id, status):
+          def sendSNS(key, ephem_id, status, satellite_id, execution_time):
               # SNS message
               print("Sending SNS notification.")
               snsclient = boto3.client('sns', region_name = os.environ.get("AWS_REGION"))
               now = datetime.now(timezone.utc).strftime("%I:%M%p %B %d, %Y")
-              FileName = "For the CPE file " + key
-              DateTime = " uploaded on " + now
-              EphemerisID = " the Ephemeris ID is " + ephem_id
-              EphemerisStatus = " and the status is " + status
+              Txt1 = "Finished Processing file " + key + " for satellite: " + satellite_id
+              Txt2 = ".     File uploaded on " + execution_time
+              Txt3 = ".     Processing completed on " + now
+              Txt4 = ".     The Ephemeris ID is " + ephem_id
+              Txt5 = " and the status is " + status
               
               response = snsclient.publish(
                   TargetArn=os.environ.get("SNS_TOPIC"),
-                  Message= FileName + DateTime + EphemerisID + EphemerisStatus,
+                  Message= Txt1 + Txt2 + Txt3 + Txt4 + Txt5,
                   Subject='Ground Station CPE Status',
               )
 
@@ -315,11 +361,12 @@ Resources:
         Variables:
           TLE_KEY: !Sub 'configs/${SatelliteName}-tle.txt'
           OEM_KEY: !Sub 'configs/${SatelliteName}.oem'
-          BUCKET: !Sub '${AWS::AccountId}-config-bucket-${AWS::Region}'
+          BUCKET: !Sub '${AWS::AccountId}-config-bucket-${SatelliteName}-${AWS::Region}'
           NORAD_ID: !Ref NoradId
           EXPIRATION: !Ref TleExpiration
           KMS_KEY: !GetAtt Key.Arn
           SNS_TOPIC: !Ref SNSTopic
+          SATELLITE_ID: !Ref SatelliteId
       Policies:
         - AWSLambdaExecute
         - Version: '2012-10-17'
@@ -340,7 +387,7 @@ Resources:
               Action:
                 - 's3:GetObject'
                 - 's3:PutObject'
-              Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-config-bucket-${AWS::Region}/*'
+              Resource: !Sub 'arn:aws:s3:::${AWS::AccountId}-config-bucket-${SatelliteName}-${AWS::Region}/*'
             - Effect: Allow
               Action:
                 - 'kms:Encrypt'
